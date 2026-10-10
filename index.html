@@ -1,21 +1,22 @@
 <!--
   ECHO CAVE — SHRINK submission (readable source; min.html is the golfed twin)
 
-  You are in a pitch-black, endless 3D cave. A tap / click / Space fires a
-  sonar ping. The wavefront lights the cave as it passes, echoes come back
-  delayed by distance and panned by direction, and a hidden beacon hums
-  somewhere. Find it by ear. But something else hears your pings too.
+  You are in a pitch-black, endless 3D cave. Ping to light it up for a moment
+  and listen to the echoes. A hidden beacon hums somewhere: find it by ear.
+  Something else hears your pings too.
+
+  Press 2 for split-screen: a race to the beacon. Player one is green on the
+  left, player two is blue on the right.
 
   Controls
-    tap / click / Space   ping
-    arrows / WASD         move and turn
-    hold pointer          walk (pointer x steers; mouse locks for free look)
+    one player   WASD or arrows move, Space / Enter / tap pings, hold to walk
+    two players  P1: WASD + Space        P2: arrows + Enter
 
   Badges
     Canvas 2D   : every dot is a fillRect on a 2D context (see "render")
     Web Audio   : oscillator -> gain envelope -> stereo panner -> feedback
                   delay (see blip / initAudio)
-    Interactive : keyboard, pointer/touch and pointer-lock mouse look
+    Interactive : keyboard and pointer/touch, one or two players
     3D          : 3D point cloud, yaw rotation, perspective divide (see "render")
 -->
 <body bgcolor=0 style=margin:0;overflow:hidden;touch-action:none>
@@ -37,19 +38,25 @@ const F = (x, z) => sin(x + seed) + sin(1.3 * z) + sin(.7 * (x + z)) - .9;
 const wrap = d => d - PERIOD * round(d / PERIOD);
 
 // ---- state ----------------------------------------------------------------
-let P;                     // points [x, y, z, brightness]; 0 = beacon, 1 = stalker
+// Points are [x, y, z, brightness]. The first four slots are special:
+//   0 beacon, 1 stalker (plus its target x,z in slots 4,5), 2 and 3 the players.
+let P;
+const SPECIAL = ['gold', 'red', 'lime', 'cyan'];
+
+// Per-player state. (px,pz) is the ping origin, r the wavefront radius.
+const players = [0, 1].map(() =>
+  ({ x: 0, z: 0, yaw: 0, px: NaN, pz: NaN, r: 99, score: 0, pings: 0, wantPing: 0 }));
+
+let split = 0;             // 0 = one player, 1 = split-screen
+let regen = 0;             // build a new cave at the end of this frame
 let A = 0, echoBus;        // AudioContext (made on first gesture) and delay input
-let u, v, a = 0;           // player x, z and yaw
-let X = 0, Z = 0, r = 99;  // ping origin and current wavefront radius
-let S = 0, n = 0;          // beacons found, pings used
-let beaconT = 0, growlT = 0, droneT = 0, stepT = 0, stepPan = .4; // sound timers
+let frame = 0;
 let D = 0, m = 0, held = 0; // pointer down, pointer x in [-.5,.5], frames held
 const K = {};              // held keys by keyCode
 
-// Place the beacon by random-walking through open space from the player,
+// Place the beacon by random-walking through open space from (x, z),
 // so it is always reachable (the cave has sealed pockets).
-function newBeacon() {
-  let x = u, z = v;
+function newBeacon(x, z) {
   for (let i = 3e3; i--;) {
     const s = x + random() - .5, t = z + random() - .5;
     if (F(s, t) < -.2) x = s, z = t;
@@ -61,8 +68,9 @@ function newBeacon() {
 // a burst that shows it for a moment before fading to black.
 function newCave() {
   seed = random() * 9;
-  P = [0, 0];
-  for (let i = 2e5; i--;) {
+  P = [0, 0, [0, 0], [0, 0]];
+  // Split-screen draws everything twice, so it gets half the points.
+  for (let i = (2 - split) * 1e5; i--;) {
     const x = random() * 63, z = random() * 63, w = F(x, z);
     const dot = y => P.push([x, y, z, 1]);
     if (w * w < .02) {
@@ -71,17 +79,21 @@ function newCave() {
       const t = random();
       if (t < .1)                                  // rolling floor / ceiling
         dot((t < .05 ? 1 : -1) * (1 + sin(x * 3) * sin(z * 3) / 4));
-      if (t > .997)                                // stalactite: column of 6 dots
-        for (let k = 1; k < 7; k++) dot(k / 6 - 1.2);
     }
   }
   // Spawn in the middle of open space, with the beacon at least 6 units away
   // (which also rules out spawning in a tiny sealed pocket).
+  let x, z;
   do {
-    u = random() * 63; v = random() * 63;
-    newBeacon();
-  } while (F(u, v) > -2 || hypot(P[0][0] - u, P[0][2] - v) < 6);
-  P[1] = [u + 31, 0, v + 31, 0]; // stalker starts as far away as the torus allows
+    x = random() * 63; z = random() * 63;
+    newBeacon(x, z);
+  } while (F(x, z) > -2 || hypot(P[0][0] - x, P[0][2] - z) < 6);
+  // The stalker starts as far away as the torus allows and stays put until
+  // someone pings.
+  P[1] = [x + 31, 0, z + 31, 0, x + 31, z + 31];
+  // Both players start on the same spot, so the race is fair.
+  for (const p of players) p.x = x, p.z = z, p.r = 99;
+  regen = 0;
 }
 newCave();
 
@@ -99,7 +111,9 @@ function initAudio() {
 }
 
 // One blip: frequency falls an octave, gain decays, panned in stereo.
-function blip(freq, delay, vol, pan, type = 'sine', len = .2) {
+// In split-screen two listeners share the speakers, so direction is given up:
+// player one's sounds go hard left and player two's hard right.
+function blip(k, freq, delay, vol, pan, type = 'sine', len = .2) {
   const t = A.currentTime + delay;
   const o = A.createOscillator(), q = A.createGain(), s = A.createStereoPanner();
   o.type = type;
@@ -107,130 +121,150 @@ function blip(freq, delay, vol, pan, type = 'sine', len = .2) {
   o.frequency.exponentialRampToValueAtTime(freq / 2, t + len);
   q.gain.setValueAtTime(vol, t);
   q.gain.exponentialRampToValueAtTime(.001, t + len);
-  s.pan.value = pan;
+  s.pan.value = split ? k * 2 - 1 : pan;
   o.connect(q).connect(s).connect(A.destination);
   s.connect(echoBus);
   o.start(t);
   o.stop(t + len);
 }
 
-function ping() {
-  initAudio();
-  X = u; Z = v; r = 0; n++;
-  blip(1500, 0, .3, 0);
+function ping(k) {
+  const p = players[k];
+  p.px = p.x; p.pz = p.z; p.r = 0; p.pings++;
+  P[1][4] = p.x; P[1][5] = p.z;           // the stalker now heads here
+  blip(k, 1500, 0, .3, 0);
   // Five rays fanned across the view. Each wall hit returns an echo whose
   // delay and loudness depend on distance and whose pan matches its direction.
   for (let i = -2; i < 3; i++) {
-    const b = a + i / 2;
+    const b = p.yaw + i / 2;
     let d = 0;
-    while (d < 14 && F(u + sin(b) * d, v + cos(b) * d) < 0) d += .2;
-    if (d < 14) blip(900, d * .08, .5 / (1 + d), sin(i / 2));
+    while (d < 14 && F(p.x + sin(b) * d, p.z + cos(b) * d) < 0) d += .2;
+    if (d < 14) blip(k, 900, d * .08, .5 / (1 + d), sin(i / 2));
   }
 }
 
 // ---- input ----------------------------------------------------------------
 onkeydown = e => {
+  initAudio();
   K[e.which] = 1;
-  if (e.which == 32 && !e.repeat) ping();
+  if (e.repeat) return;
+  if (e.which == 32) players[0].wantPing = 1;      // Space: player one
+  if (e.which == 13) players[split].wantPing = 1;  // Enter: player two, if any
+  if (e.which == 50) split ^= 1, regen = 1;        // 2: toggle split-screen
 };
 onkeyup = e => K[e.which] = 0;
-onpointermove = e => {
-  if (document.pointerLockElement) a += e.movementX / 400, m = 0; // mouse look
-  else m = e.x / innerWidth - .5;                                 // touch steer
-};
-onpointerdown = e => {
-  initAudio();                 // must happen inside the gesture
-  D = 1; held = 0;
-  onpointermove(e);
-  if (e.pointerType == 'mouse') c.requestPointerLock();
-};
+onpointermove = e => m = e.x / innerWidth - .5;
+onpointerdown = e => { initAudio(); D = 1; held = 0; onpointermove(e); };
 onpointerup = e => {
   D = 0;
-  if (held < 15) ping();       // a short tap pings; a long hold was a walk
+  if (held < 15) players[0].wantPing = 1; // a short tap pings; a hold was a walk
 };
 
 // ---- frame ----------------------------------------------------------------
 setInterval(() => {
   const w = c.width = innerWidth, h = c.height = innerHeight; // also clears
-
-  // Turn and move. Axes are tested separately so the player slides on walls.
   held += D;
-  a += ((K[39] | K[68]) - (K[37] | K[65]) + D * m * 2) * .04;
-  const I = sin(a), O = cos(a);
-  const step = ((K[38] | K[87]) - (K[40] | K[83]) + (held * D > 15)) * .06;
-  if (F(u + I * step, v) < -.2) u += I * step;
-  if (F(u, v + O * step) < -.2) v += O * step;
-
-  if (A) {
-    // footsteps: a thud every 20 moving frames, alternating left / right
-    if (step && --stepT < 0) stepT = 20, blip(90, 0, .2, stepPan = -stepPan);
-    // ambience: a slow 6 s sub-bass swell every 5 s
-    if (--droneT < 0) droneT = 300, blip(80, 0, .1, 0, 'sine', 6);
-  }
-
-  r += .25; // wavefront expands
+  frame++;
 
   // The stalker drifts straight towards the last ping, through walls.
   const st = P[1];
   {
-    const x = wrap(X - st[0]), z = wrap(Z - st[2]), d = hypot(x, z);
+    const x = wrap(st[4] - st[0]), z = wrap(st[5] - st[2]), d = hypot(x, z);
     if (d > .1) st[0] += x / d * .025, st[2] += z / d * .025;
   }
 
-  let bx = 0, bz = 1, sx = 0, sz = 9; // beacon and stalker in camera space
+  const viewW = w / (1 + split);
 
-  // render
-  P.forEach((p, i) => {
-    // camera space: nearest torus copy, relative to the player, rotated by yaw
-    let x = wrap(p[0] - u), z = wrap(p[2] - v);
-    const depth = x * I + z * O, side = x * O - z * I;
-    if (i == 0) bx = side, bz = depth;
-    if (i == 1) sx = side, sz = depth;
+  for (let k = 0; k <= split; k++) {
+    const p = players[k];
+    if (p.wantPing) p.wantPing = 0, ping(k);
 
-    // Lit when the wavefront reaches it, if nothing solid lies between the
-    // ping origin and the point (8 samples along the line).
-    x = wrap(p[0] - X); z = wrap(p[2] - Z);
-    const d = hypot(x, z);
-    if (d < r && d > r - .3 && r < 16) {
-      let k = 9;
-      while (--k && F(X + x * k / 9, Z + z * k / 9) < .2);
-      if (!k) p[3] = 1;
-    }
-    const e = p[3] *= .985; // fade
+    // Arrow keys belong to the last player, WASD to player one. With one
+    // player that is the same person, so both sets work.
+    const key = (arrow, wasd) => (K[arrow] | 0) * (k == split) + (K[wasd] | 0) * !k;
+    const touch = !k; // pointer input drives player one only
 
-    // perspective projection onto the 2D canvas
-    if (depth > .1 && e > .02) {
-      g.globalAlpha = e;
-      g.fillStyle = i > 1 ? `rgb(${255 - depth * 30},${255 - depth * 12},255)`
-                  : i ? 'red' : 'gold';
-      const f = h / depth * .8, size = (i > 1 ? 9 : 50) / depth + 1;
-      g.fillRect(w / 2 + side * f, h / 2 + p[1] * f, size, size);
-    }
-  });
+    // Turn and move. Axes are tested separately so the player slides on walls.
+    p.yaw += (key(39, 68) - key(37, 65) + D * m * 2 * touch) * .04;
+    const I = sin(p.yaw), O = cos(p.yaw);
+    const step = (key(38, 87) - key(40, 83) + (held * D > 15 && touch)) * .06;
+    if (F(p.x + I * step, p.z) < -.2) p.x += I * step;
+    if (F(p.x, p.z + O * step) < -.2) p.z += O * step;
 
-  if (A) {
-    // Beacon hum once a second: panned by bearing, quieter with distance,
-    // an octave lower when it is behind you.
-    let d = hypot(bx, bz);
-    if (--beaconT < 0) beaconT = 60, blip(bz > 0 ? 440 : 220, 0, .4 / (1 + d), bx / (d + 1));
-    if (d < 1) { // found it: jingle, then a brand new cave
-      S++;
-      blip(600, 0, .3, 0); blip(900, .15, .3, 0); blip(1200, .3, .3, 0);
-      newCave();
+    if (A) {
+      if (step && frame % 20 == 0) blip(k, 90, 0, .2, 0);          // footsteps
+      if (frame % 300 == 0) blip(k, 80, 0, .1, 0, 'sine', 6);      // ambience
     }
-    // Stalker growl: a sawtooth that repeats faster and louder as it closes in.
-    d = hypot(sx, sz);
-    if (--growlT < 0) growlT = d * 6 + 9, blip(60, 0, .6 / (1 + d / 3), sx / (d + 1), 'sawtooth');
-    if (d < .8) { // caught: score resets, new cave
-      S = n = 0;
-      blip(300, 0, .5, 0, 'sawtooth', 1);
-      newCave();
+
+    p.r += .25; // wavefront expands
+    P[2 + k][0] = p.x; P[2 + k][2] = p.z; // this player's marker, seen by the other
+
+    let bx = 0, bz = 1, sx = 0, sz = 9; // beacon and stalker in camera space
+
+    // render this player's view
+    P.forEach((pt, i) => {
+      // camera space: nearest torus copy, relative to the player, rotated by yaw
+      let x = wrap(pt[0] - p.x), z = wrap(pt[2] - p.z);
+      const depth = x * I + z * O, side = x * O - z * I;
+      if (i == 0) bx = side, bz = depth;
+      if (i == 1) sx = side, sz = depth;
+
+      // Lit when this player's wavefront reaches it, if nothing solid lies
+      // between the ping origin and the point (8 samples along the line).
+      // Brightness is shared, so a ping lights the cave for both players.
+      x = wrap(pt[0] - p.px); z = wrap(pt[2] - p.pz);
+      const d = hypot(x, z);
+      if (d < p.r && d > p.r - .3 && p.r < 16) {
+        let n = 9;
+        while (--n && F(p.px + x * n / 9, p.pz + z * n / 9) < .2);
+        if (!n) pt[3] = 1;
+      }
+      if (!k) pt[3] *= .985; // fade once per frame, not once per view
+      const e = pt[3];
+
+      // perspective projection into this player's half of the canvas
+      const f = h / depth * .8;
+      if (depth > .1 && e > .02 && (side * f) ** 2 < viewW * viewW / 4) {
+        const t = 99 - depth * 9;
+        g.globalAlpha = e;
+        g.fillStyle = i > 3
+          ? (k ? `rgb(${t},150,255)` : `rgb(${t},255,${t})`) // P2 blue, P1 green
+          : SPECIAL[i];
+        const size = (i > 3 ? 9 : 50) / depth + 1;
+        g.fillRect(viewW * (k + .5) + side * f, h / 2 + pt[1] * f, size, size);
+      }
+    });
+
+    if (A) {
+      // Beacon hum once a second: panned by bearing, quieter with distance,
+      // an octave lower when it is behind you.
+      let d = hypot(bx, bz);
+      if (frame % 60 == 0) blip(k, bz > 0 ? 440 : 220, 0, .4 / (1 + d), bx / (d + 1));
+      if (d < 1) { // found it: jingle, then a brand new cave for everyone
+        p.score++;
+        blip(k, 600, 0, .3, 0); blip(k, 1200, .2, .3, 0);
+        regen = 1;
+      }
+      // Stalker growl: a sawtooth that repeats faster and louder as it closes in.
+      d = hypot(sx, sz);
+      if (frame % (d * 6 + 9 | 0) == 0) blip(k, 60, 0, .6 / (1 + d / 3), sx / (d + 1), 'sawtooth');
+      if (d < .8) { // caught: this player's score resets, new cave
+        p.score = p.pings = 0;
+        blip(k, 300, 0, .5, 0, 'sawtooth', 1);
+        regen = 1;
+      }
     }
+
+    g.globalAlpha = 1;
+    g.fillStyle = 'gold';
+    g.font = '20px a';
+    g.fillText(
+      p.pings ? 'found:' + p.score
+        : split ? (k ? 'ARROWS+ENTER' : 'WASD+SPACE')
+        : 'SPACE=PING,2=SPLIT',
+      viewW * k + 9, 24);
   }
 
-  g.globalAlpha = 1;
-  g.fillStyle = 'gold';
-  g.font = '20px a';
-  g.fillText(n ? `found:${S},pings:${n}` : 'CLICK=PING,ARROWS=MOVE', 9, 24);
+  if (regen) newCave();
 }, 16);
 </script>
